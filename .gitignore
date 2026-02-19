@@ -1,0 +1,109 @@
+# Downloaded data and built DBs (large)
+downloads/
+blast_db/
+
+# Sequence files (FASTA, FASTQ)
+*.fa
+*.fa.gz
+*.faa
+*.faa.gz
+*.fna
+*.fna.gz
+*.fasta
+*.fasta.gz
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+
+# Alignments
+*.sam
+*.bam
+*.bam.bai
+*.cram
+*.cram.crai
+
+# Annotations
+*.gff
+*.gff.gz
+*.gff3
+*.gff3.gz
+*.gtf
+*.gtf.gz
+*.bed
+*.bed.gz
+
+# BLAST databases
+*.ndb
+*.nhr
+*.nin
+*.njs
+*.nog
+*.nos
+*.not
+*.nsq
+*.ntf
+*.nto
+*.pdb
+*.phr
+*.pin
+*.pjs
+*.pog
+*.pos
+*.pot
+*.psq
+*.ptf
+*.pto
+*.nal
+*.pal
+
+# Sequence indices
+*.fai
+*.dict
+*.amb
+*.ann
+*.bwt
+*.pac
+*.sa
+
+# VCF / variant files
+*.vcf
+*.vcf.gz
+*.vcf.gz.tbi
+*.bcf
+
+# Archive / compressed data
+*.tar.gz
+*.tgz
+*.zip
+
+# NCBI datasets artifacts
+ncbi_dataset/
+fetch.txt
+manifest.json
+
+# WormBase ParaSite downloads
+wormbase_parasite/
+
+# Conda environment
+genomes_env/
+.conda/
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.Python
+*.egg-info/
+.eggs/
+*.pyc
+
+# Editor / OS
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
+.cursor/

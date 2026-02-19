@@ -1,0 +1,901 @@
+#!/usr/bin/env python3
+"""
+Download genomes from NCBI BioProjects (CSV input).
+Subcommands: status, download, repair.
+Uses ncbi-datasets-cli. Writes manifest.json per label. Supports --dry-run and file logging.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import gzip
+import json
+import logging
+import shutil
+import subprocess
+import sys
+import time
+import zipfile
+from pathlib import Path
+from shutil import which
+from typing import Any
+from urllib.request import urlopen, urlretrieve
+from urllib.error import URLError, HTTPError
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+LOG_FILE = "download.log"
+DEFAULT_DOWNLOAD_ROOT = "downloads"
+DEFAULT_CSV = "bioprojects.csv"
+DATASETS_CMD = "datasets"
+ENA_DATA_GET = "enaDataGet"
+NCBI_DATA_DIR = "ncbi_dataset"
+DATA_SUBDIR = "data"
+MANIFEST_NAME = "manifest.json"
+FETCH_TXT = "fetch.txt"
+ENA_FTP_BASE = "ftp://ftp.ebi.ac.uk/pub/databases/ena/assembly"
+ENA_FTP_ASSEMBLY_BASE = "https://www.ebi.ac.uk/ena/portal/api/filereport"
+WBPS_FTP_BASE = "https://ftp.ebi.ac.uk/pub/databases/wormbase/parasite/releases"
+WBPS_DEFAULT_VERSION = "WBPS19"
+WBPS_DATA_DIR = "wormbase_parasite"
+
+WBPS_FILE_TYPES = {
+    "genome": "genomic.fa",
+    "genome_softmasked": "genomic_softmasked.fa",
+    "genome_masked": "genomic_masked.fa",
+    "gff3": "annotations.gff3",
+    "protein": "protein.fa",
+    "cds_transcripts": "CDS_transcripts.fa",
+    "mrna_transcripts": "mRNA_transcripts.fa",
+    "gtf": "canonical_geneset.gtf",
+}
+
+
+def load_config(config_path: Path | None) -> dict[str, Any]:
+    """Load config.yml if present. Returns dict with download_root, rehydrate_workers, etc."""
+    out = {
+        "download_root": DEFAULT_DOWNLOAD_ROOT,
+        "rehydrate_workers": None,
+        "assembly_level": None,
+        "wbps_version": WBPS_DEFAULT_VERSION,
+    }
+    if config_path is None or not config_path.exists():
+        return out
+    if yaml is None:
+        logging.warning("PyYAML not installed; config.yml ignored")
+        return out
+    try:
+        with open(config_path, "r") as f:
+            data = yaml.safe_load(f) or {}
+        out["download_root"] = data.get("download_root", out["download_root"])
+        out["rehydrate_workers"] = data.get("rehydrate_workers")
+        out["assembly_level"] = data.get("assembly_level")
+        out["wbps_version"] = data.get("wbps_version", out["wbps_version"])
+    except Exception as e:
+        logging.warning("Failed to load config.yml: %s; using defaults", e)
+    return out
+
+
+def wbps_file_url(species: str, bioproject: str, filetype: str, version: str = WBPS_DEFAULT_VERSION) -> str:
+    """Construct WormBase ParaSite FTP URL for a specific file type.
+    ``species`` is lowercase underscore-separated (e.g. ``hymenolepis_microstoma``).
+    ``filetype`` is the suffix before ``.gz`` (e.g. ``annotations.gff3``, ``protein.fa``).
+    """
+    return (
+        f"{WBPS_FTP_BASE}/{version}/species/{species}/{bioproject}/"
+        f"{species}.{bioproject}.{version}.{filetype}.gz"
+    )
+
+
+
+def find_wormbase_data_dir(label_dir: Path) -> Path | None:
+    """Return the wormbase_parasite subdirectory if it exists."""
+    d = label_dir / WBPS_DATA_DIR
+    return d if d.is_dir() else None
+
+
+def _decompress_gz(gz_path: Path, log: logging.Logger) -> Path:
+    """Decompress a .gz file in place, returning the path to the decompressed file."""
+    out_path = gz_path.with_suffix("")  # strip .gz
+    log.debug("Decompressing %s -> %s", gz_path.name, out_path.name)
+    with gzip.open(gz_path, "rb") as f_in, open(out_path, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
+    gz_path.unlink()
+    return out_path
+
+
+def download_from_wormbase(
+    wormbase_species: str,
+    bioproject: str,
+    label_dir: Path,
+    file_types: list[str],
+    dry_run: bool,
+    log: logging.Logger,
+    wbps_version: str = WBPS_DEFAULT_VERSION,
+) -> dict[str, Path]:
+    """Download specified file types from WormBase ParaSite FTP.
+
+    ``file_types`` are keys from WBPS_FILE_TYPES (e.g. ``["gff3", "protein"]``).
+    Uses the row's own bioproject as the WormBase bioproject (annotations must match the assembly).
+    Returns a dict mapping successfully downloaded file type keys to their local paths.
+    """
+    wbps_dir = label_dir / WBPS_DATA_DIR
+    log.info("Attempting WormBase ParaSite download for %s/%s (version %s)",
+             wormbase_species, bioproject, wbps_version)
+
+    if dry_run:
+        for ft in file_types:
+            suffix = WBPS_FILE_TYPES.get(ft)
+            if suffix:
+                url = wbps_file_url(wormbase_species, bioproject, suffix, wbps_version)
+                log.info("Would download: %s", url)
+        return {}
+
+    wbps_dir.mkdir(parents=True, exist_ok=True)
+    downloaded: dict[str, Path] = {}
+
+    for ft in file_types:
+        suffix = WBPS_FILE_TYPES.get(ft)
+        if suffix is None:
+            log.warning("Unknown WormBase file type: %s (valid: %s)", ft, ", ".join(WBPS_FILE_TYPES))
+            continue
+        url = wbps_file_url(wormbase_species, bioproject, suffix, wbps_version)
+        gz_filename = f"{wormbase_species}.{bioproject}.{wbps_version}.{suffix}.gz"
+        gz_path = wbps_dir / gz_filename
+        log.info("Downloading %s from WormBase ParaSite...", suffix)
+        log.debug("URL: %s", url)
+        try:
+            urlretrieve(url, gz_path)
+            if gz_path.exists() and gz_path.stat().st_size > 0:
+                out_path = _decompress_gz(gz_path, log)
+                downloaded[ft] = out_path
+                log.info("Downloaded and decompressed: %s (%d bytes)", out_path.name, out_path.stat().st_size)
+            else:
+                log.warning("Downloaded file is empty: %s", gz_path)
+                gz_path.unlink(missing_ok=True)
+        except (URLError, HTTPError, OSError) as e:
+            log.warning("Failed to download %s from WormBase: %s", suffix, e)
+            gz_path.unlink(missing_ok=True)
+
+    if downloaded:
+        log.info("WormBase ParaSite: downloaded %d/%d requested file(s)", len(downloaded), len(file_types))
+    else:
+        log.warning("WormBase ParaSite: no files downloaded for %s/%s", wormbase_species, bioproject)
+    return downloaded
+
+
+def read_csv(csv_path: Path) -> list[dict[str, str]]:
+    """Read bioprojects CSV; normalize column names and defaults. Filter skipped rows."""
+    rows = []
+    with open(csv_path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            r = {k.strip().lower().replace(" ", "_"): v.strip() if isinstance(v, str) else v for k, v in row.items()}
+            bioproject = (r.get("bioproject") or "").strip()
+            if not bioproject:
+                continue
+            skip_val = (r.get("skip") or "false").strip().lower()
+            if skip_val in ("true", "1", "yes"):
+                continue
+            label = (r.get("label") or bioproject).strip()
+            r["bioproject"] = bioproject
+            r["label"] = label
+            r["source"] = detect_project_source(bioproject)
+            r["assembly_level"] = (r.get("assembly_level") or "").strip() or None
+            inc_ann = (r.get("include_annotation") or "true").strip().lower()
+            r["include_annotation"] = inc_ann in ("true", "1", "yes")
+            inc_prot = (r.get("include_protein") or "true").strip().lower()
+            r["include_protein"] = inc_prot in ("true", "1", "yes")
+            r["wormbase_species"] = (r.get("wormbase_species") or "").strip()
+            rows.append(r)
+    return rows
+
+
+def get_label_dir(download_root: Path, label: str) -> Path:
+    return download_root / label
+
+
+def has_fetch_txt(label_dir: Path) -> bool:
+    return (label_dir / FETCH_TXT).exists()
+
+
+def detect_project_source(bioproject: str) -> str:
+    """Detect project source from BioProject prefix. Returns 'ENA', 'DDBJ', or 'NCBI'."""
+    bioproject_upper = bioproject.upper()
+    if bioproject_upper.startswith(("PRJEB", "PRJEA")):
+        return "ENA"
+    elif bioproject_upper.startswith("PRJDB"):
+        return "DDBJ"
+    else:
+        return "NCBI"
+
+
+def find_ncbi_data_dir(label_dir: Path) -> Path | None:
+    d = label_dir / NCBI_DATA_DIR / DATA_SUBDIR
+    return d if d.is_dir() else None
+
+
+def find_ena_data_dir(label_dir: Path) -> Path | None:
+    """Find ENA download directory. enaDataGet creates a dir named after the accession."""
+    # enaDataGet creates a directory named after the accession (e.g., GCA_000469805.3)
+    # Look for common ENA directory patterns
+    for item in label_dir.iterdir():
+        if item.is_dir() and (item.name.startswith("GCA_") or item.name.startswith("GCF_")):
+            # Check if it contains sequence files
+            if any(item.rglob("*.fa*")) or any(item.rglob("*.embl")):
+                return item
+    return None
+
+
+
+
+def _collect_genome_fasta(dirs: list[Path | None]) -> list[Path]:
+    """Collect genome FASTA files from NCBI, ENA, and WormBase data directories."""
+    fnas: list[Path] = []
+    for d in dirs:
+        if d is None:
+            continue
+        fnas.extend(list(d.rglob("*.fna")))
+        fnas.extend([f for f in d.rglob("*.fa") if "protein" not in f.name.lower()])
+        fnas.extend([f for f in d.rglob("*.fasta") if "protein" not in f.name.lower()])
+    return fnas
+
+
+def _collect_gff(dirs: list[Path | None]) -> list[Path]:
+    """Collect GFF/GFF3 files from all data directories."""
+    gffs: list[Path] = []
+    for d in dirs:
+        if d is None:
+            continue
+        gffs.extend(f for f in d.rglob("*.gff*") if f.suffix in (".gff", ".gff3"))
+    return gffs
+
+
+def _collect_protein(dirs: list[Path | None]) -> list[Path]:
+    """Collect protein FASTA files from all data directories."""
+    faas: list[Path] = []
+    for d in dirs:
+        if d is None:
+            continue
+        faas.extend(list(d.rglob("*.faa")))
+        faas.extend([f for f in d.rglob("*.fa") if "protein" in f.name.lower()])
+    return faas
+
+
+def get_status(label_dir: Path, include_annotation: bool, include_protein: bool) -> str:
+    """
+    Return: not_started | dehydrated_only | rehydrated | complete.
+    complete = genome FASTA (and optionally GFF, protein) present and non-empty.
+    Supports NCBI, ENA, and WormBase ParaSite download structures.
+    """
+    if not label_dir.exists():
+        return "not_started"
+    data_dir = find_ncbi_data_dir(label_dir)
+    ena_dir = find_ena_data_dir(label_dir)
+    wbps_dir = find_wormbase_data_dir(label_dir)
+    if data_dir is None and ena_dir is None and wbps_dir is None:
+        if has_fetch_txt(label_dir):
+            return "dehydrated_only"
+        return "rehydrated"
+    dirs: list[Path | None] = [data_dir, ena_dir, wbps_dir]
+    fnas = _collect_genome_fasta(dirs)
+    if not fnas:
+        if has_fetch_txt(label_dir):
+            return "dehydrated_only"
+        return "rehydrated"
+    if any(f.stat().st_size == 0 for f in fnas):
+        return "rehydrated"
+    if include_annotation:
+        gffs = _collect_gff(dirs)
+        if not gffs or any(f.stat().st_size == 0 for f in gffs):
+            if has_fetch_txt(label_dir):
+                return "dehydrated_only"
+            return "rehydrated"
+    if include_protein:
+        faas = _collect_protein(dirs)
+        if not faas or any(f.stat().st_size == 0 for f in faas):
+            if has_fetch_txt(label_dir):
+                return "dehydrated_only"
+            return "rehydrated"
+    return "complete"
+
+
+def run_cmd(cmd: list[str], dry_run: bool, log: logging.Logger, max_retries: int = 3, retry_delay: int = 5) -> bool:
+    """
+    Run command with retry logic for network failures.
+    Returns True on success, False on failure.
+    """
+    log.info("Run: %s", " ".join(cmd))
+    if dry_run:
+        return True
+    for attempt in range(1, max_retries + 1):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                return True
+            # Command failed - check if it's a network error
+            stderr_text = (result.stderr or "").lower()
+            stdout_text = (result.stdout or "").lower()
+            combined = stderr_text + stdout_text
+            is_network_error = any(term in combined for term in ["timeout", "i/o timeout", "connection", "network", "gateway", "dial tcp"])
+            if is_network_error and attempt < max_retries:
+                log.warning("Network error (attempt %d/%d). Retrying in %d seconds...", attempt, max_retries, retry_delay)
+                if stderr_text:
+                    log.debug("Error details: %s", stderr_text[:200])
+                time.sleep(retry_delay)
+                continue
+            # Not a retryable error or out of retries
+            error_msg = f"Command returned {result.returncode}"
+            if stderr_text:
+                error_msg += f"\nstderr: {stderr_text[:500]}"
+            log.error("Command failed: %s", error_msg)
+            return False
+        except FileNotFoundError:
+            log.error("Command not found: %s (install ncbi-datasets-cli)", cmd[0])
+            return False
+    return False
+
+
+def build_include(include_annotation: bool, include_protein: bool) -> str:
+    parts = ["genome"]
+    if include_annotation:
+        parts.append("gff3")
+    if include_protein:
+        parts.append("protein")
+    return ",".join(parts)
+
+
+def download_from_ena_ftp(
+    assembly_id: str,
+    label_dir: Path,
+    log: logging.Logger,
+) -> bool:
+    """
+    Download assembly FASTA directly from ENA FTP/API.
+    Uses ENA Portal API to get file URLs, then downloads FASTA files.
+    Returns True on success, False on failure.
+    """
+    log.info("Attempting direct ENA FTP download for %s", assembly_id)
+    label_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Use ENA Portal API to get file report
+    # For GCA accessions, use result=assembly (not analysis - GCA accessions aren't valid for analysis)
+    # First try without fields to see what's available, then try common field names
+    api_urls = [
+        f"{ENA_FTP_ASSEMBLY_BASE}?accession={assembly_id}&result=assembly",
+        f"{ENA_FTP_ASSEMBLY_BASE}?accession={assembly_id}&result=assembly&fields=file_ftp",
+        f"{ENA_FTP_ASSEMBLY_BASE}?accession={assembly_id}&result=assembly&fields=ftp_path",
+        f"{ENA_FTP_ASSEMBLY_BASE}?accession={assembly_id}&result=assembly&fields=fasta_file",
+    ]
+    
+    for api_url in api_urls:
+        try:
+            log.debug("Querying ENA API: %s", api_url)
+            with urlopen(api_url, timeout=30) as response:
+                content = response.read().decode("utf-8")
+                if not content.strip():
+                    log.debug("ENA API returned empty response for %s", assembly_id)
+                    continue
+                lines = content.strip().split("\n")
+                log.debug("ENA API response for %s: %d lines, first 500 chars: %s", assembly_id, len(lines), content[:500])
+                if len(lines) < 2:
+                    log.debug("ENA API returned insufficient data for %s (only %d line(s))", assembly_id, len(lines))
+                    continue
+                # First line is header, second line has the data
+                if not lines[1].strip():
+                    log.debug("ENA API returned empty data line for %s (trying next endpoint)", assembly_id)
+                    continue
+                # Parse tab-separated values: look for FTP-related columns
+                headers = lines[0].split("\t")
+                # Try to find FTP-related columns (common names: file_ftp, ftp_path, fasta_ftp, etc.)
+                ftp_col_idx = None
+                for col_name in ["file_ftp", "ftp_path", "fasta_ftp", "ftp_file", "fasta_file"]:
+                    try:
+                        ftp_col_idx = headers.index(col_name)
+                        log.debug("Found FTP column '%s' at index %d", col_name, ftp_col_idx)
+                        break
+                    except ValueError:
+                        continue
+                
+                if ftp_col_idx is None:
+                    # If no specific FTP column found, log available columns for debugging
+                    log.debug("ENA API response for %s - available columns: %s", assembly_id, ", ".join(headers))
+                    log.debug("Full response (first 500 chars): %s", content[:500])
+                    continue
+                
+                # Get FTP URLs from the found column (comma-separated)
+                data_line = lines[1].split("\t")
+                if len(data_line) <= ftp_col_idx:
+                    log.debug("ENA API response missing FTP data for %s", assembly_id)
+                    continue
+                ftp_urls_str = data_line[ftp_col_idx].strip()
+                if not ftp_urls_str:
+                    log.debug("No FTP URLs found for %s in API response", assembly_id)
+                    continue
+                ftp_urls = [url.strip() for url in ftp_urls_str.split(",") if url.strip()]
+                if not ftp_urls:
+                    log.debug("No valid FTP URLs found for %s", assembly_id)
+                    continue
+                # Download each FASTA file
+                downloaded = False
+                for ftp_url in ftp_urls:
+                    if not ftp_url.startswith("ftp://"):
+                        log.debug("Skipping non-FTP URL: %s", ftp_url)
+                        continue
+                    filename = ftp_url.split("/")[-1]
+                    local_path = label_dir / filename
+                    log.info("Downloading %s from ENA FTP...", filename)
+                    try:
+                        urlretrieve(ftp_url, local_path)
+                        if local_path.exists() and local_path.stat().st_size > 0:
+                            downloaded = True
+                            log.info("Downloaded: %s", local_path)
+                        else:
+                            log.warning("Downloaded file is empty: %s", local_path)
+                            local_path.unlink(missing_ok=True)
+                    except (URLError, OSError) as e:
+                        log.warning("Failed to download %s: %s", ftp_url, e)
+                if downloaded:
+                    return True
+        except HTTPError as e:
+            # Capture HTTP error details including response body
+            error_msg = f"HTTP {e.code}"
+            if e.reason:
+                error_msg += f": {e.reason}"
+            # Read error response body
+            try:
+                error_body = e.read().decode('utf-8')[:500]
+                if error_body:
+                    error_msg += f" - Response: {error_body}"
+            except Exception:
+                pass
+            log.debug("ENA API query failed for %s: %s (trying next endpoint)", assembly_id, error_msg)
+            continue
+        except URLError as e:
+            error_msg = str(e)
+            if hasattr(e, 'reason') and e.reason:
+                error_msg = f"{e.reason}"
+            log.debug("ENA API query failed for %s: %s (trying next endpoint)", assembly_id, error_msg)
+            continue
+        except (TimeoutError, ValueError) as e:
+            log.debug("ENA API query error for %s: %s (trying next endpoint)", assembly_id, e)
+            continue
+    
+    # If all API endpoints failed, try constructing FTP path directly
+    # ENA FTP structure: ftp://ftp.ebi.ac.uk/pub/databases/ena/assembly/GCA_XXX/XXX_YYY/
+    log.info("API queries failed, trying direct FTP path construction for %s", assembly_id)
+    gca_prefix = assembly_id.split("_")[0]  # e.g., "GCA"
+    gca_number = "_".join(assembly_id.split("_")[1:])  # e.g., "000469805.3"
+    gca_number_underscore = gca_number.replace(".", "_")  # e.g., "000469805_3"
+    
+    # Try common FTP paths
+    ftp_base_paths = [
+        f"ftp://ftp.ebi.ac.uk/pub/databases/ena/assembly/{gca_prefix}_{gca_number.split('.')[0]}/{gca_number_underscore}/",
+        f"ftp://ftp.ebi.ac.uk/pub/databases/ena/assembly/{gca_prefix}_{gca_number.split('.')[0]}/{assembly_id.replace('.', '_')}/",
+    ]
+    
+    for ftp_base_path in ftp_base_paths:
+        log.debug("Trying FTP base path: %s", ftp_base_path)
+        # Try to list directory and find FASTA files
+        # Common FASTA file patterns: *.fa, *.fasta, *.fna, assembly.fa, etc.
+        fasta_patterns = [
+            f"{ftp_base_path}{assembly_id}_genomic.fna.gz",
+            f"{ftp_base_path}{assembly_id}_genomic.fna",
+            f"{ftp_base_path}assembly.fa.gz",
+            f"{ftp_base_path}assembly.fa",
+            f"{ftp_base_path}*.fa.gz",
+            f"{ftp_base_path}*.fna.gz",
+        ]
+        
+        # For now, try direct download of most common pattern
+        # Note: This is a simplified approach - a full implementation would need to list the directory first
+        common_fasta = f"{ftp_base_path}{assembly_id}_genomic.fna.gz"
+        local_path = label_dir / f"{assembly_id}_genomic.fna.gz"
+        try:
+            log.info("Attempting direct download from: %s", common_fasta)
+            urlretrieve(common_fasta, local_path)
+            if local_path.exists() and local_path.stat().st_size > 0:
+                log.info("Successfully downloaded: %s", local_path)
+                return True
+            else:
+                local_path.unlink(missing_ok=True)
+        except (URLError, OSError) as e:
+            log.debug("Direct FTP download failed for %s: %s", common_fasta, e)
+            continue
+    
+    # If all methods failed, provide helpful error message
+    log.warning("ENA FTP download failed for %s: All methods (API and direct FTP) returned no data", assembly_id)
+    log.info("Assembly %s may not be available via ENA, or may require manual download from ENA Browser", assembly_id)
+    log.info("Check: https://www.ebi.ac.uk/ena/browser/view/%s", assembly_id)
+    log.info("Or try manual FTP download from: ftp://ftp.ebi.ac.uk/pub/databases/ena/assembly/")
+    return False
+
+
+def download_from_ena(
+    assembly_id: str,
+    label_dir: Path,
+    include_annotation: bool,
+    include_protein: bool,
+    dry_run: bool,
+    log: logging.Logger,
+) -> bool:
+    """
+    Download assembly from ENA using enaBrowserTools (enaDataGet), with FTP fallback.
+    Returns True on success, False on failure.
+    """
+    log.info("Attempting ENA download for %s", assembly_id)
+    if dry_run:
+        log.info("Would try: %s -f fasta -d %s %s (or direct FTP)", ENA_DATA_GET, label_dir, assembly_id)
+        return True
+    
+    # Try enaDataGet first if available
+    ena_cmd_path = which(ENA_DATA_GET)
+    if ena_cmd_path:
+        log.debug("Found %s at: %s", ENA_DATA_GET, ena_cmd_path)
+        label_dir.mkdir(parents=True, exist_ok=True)
+        cmd = [ENA_DATA_GET, "-f", "fasta", "-d", str(label_dir), assembly_id]
+        if run_cmd(cmd, dry_run, log):
+            # Check if download succeeded
+            ena_dir = find_ena_data_dir(label_dir)
+            if ena_dir and any(ena_dir.rglob("*.fa*")):
+                log.info("ENA download succeeded via enaDataGet: %s", ena_dir)
+                return True
+        log.info("enaDataGet failed or incomplete, trying direct FTP download...")
+    
+    # Fallback to direct FTP download
+    if download_from_ena_ftp(assembly_id, label_dir, log):
+        # Check if download succeeded
+        if any(label_dir.rglob("*.fa*")):
+            log.info("ENA download succeeded via direct FTP")
+            return True
+    
+    log.warning("ENA download failed for %s (tried both enaDataGet and direct FTP)", assembly_id)
+    log.info("You may need to download manually from ENA FTP or fix enaBrowserTools Python compatibility")
+    return False
+
+
+def discover_manifest_paths(label_dir: Path, include_protein: bool) -> dict[str, list[str]]:
+    """Discover paths to genome FASTA, GFF, and optionally protein FASTA.
+    Supports NCBI, ENA, and WormBase ParaSite download structures."""
+    out: dict[str, list[str]] = {"genome_fasta": [], "gff": [], "protein_fasta": []}
+    seen: set[str] = set()
+
+    def _add(key: str, path: Path) -> None:
+        resolved = str(path.resolve())
+        if resolved not in seen:
+            seen.add(resolved)
+            out[key].append(resolved)
+
+    # WormBase first so its curated annotations/proteins are preferred (appear first in lists)
+    for d in (find_wormbase_data_dir(label_dir), find_ncbi_data_dir(label_dir), find_ena_data_dir(label_dir)):
+        if d is None:
+            continue
+        for f in d.rglob("*.fna"):
+            if f.is_file() and f.stat().st_size > 0:
+                _add("genome_fasta", f)
+        for f in d.rglob("*.fa"):
+            if f.is_file() and f.stat().st_size > 0:
+                if "protein" in f.name.lower():
+                    if include_protein:
+                        _add("protein_fasta", f)
+                else:
+                    _add("genome_fasta", f)
+        for f in d.rglob("*.fasta"):
+            if f.is_file() and f.stat().st_size > 0 and "protein" not in f.name.lower():
+                _add("genome_fasta", f)
+        for f in d.rglob("*.faa"):
+            if f.is_file() and f.stat().st_size > 0 and include_protein:
+                _add("protein_fasta", f)
+        for f in d.rglob("*.gff*"):
+            if f.is_file() and f.suffix in (".gff", ".gff3") and f.stat().st_size > 0:
+                _add("gff", f)
+    return out
+
+
+def write_manifest(label_dir: Path, manifest_data: dict, dry_run: bool, log: logging.Logger) -> None:
+    path = label_dir / MANIFEST_NAME
+    log.info("Write manifest: %s", path)
+    if dry_run:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(manifest_data, f, indent=2)
+    except (OSError, json.JSONEncodeError) as e:
+        log.error("Failed to write manifest %s: %s", path, e)
+        raise
+
+
+def validate_download(label_dir: Path, include_annotation: bool, include_protein: bool, log: logging.Logger) -> tuple[bool, bool, bool]:
+    """
+    Check expected files exist and have size > 0. Returns (valid, missing_gff, missing_protein).
+    Genome FASTA is required; GFF and protein are optional (warn if missing but requested).
+    Supports NCBI, ENA, and WormBase ParaSite download structures.
+    """
+    dirs: list[Path | None] = [find_ncbi_data_dir(label_dir), find_ena_data_dir(label_dir), find_wormbase_data_dir(label_dir)]
+    if all(d is None for d in dirs):
+        log.warning("No ncbi_dataset/data, ENA, or WormBase download dir under %s", label_dir)
+        return False, False, False
+    fnas = _collect_genome_fasta(dirs)
+    if not fnas:
+        log.warning("No genome FASTA files under %s", label_dir)
+        return False, False, False
+    for f in fnas:
+        if f.stat().st_size == 0:
+            log.warning("Empty file: %s", f)
+            return False, False, False
+    missing_gff = False
+    if include_annotation:
+        gffs = _collect_gff(dirs)
+        if not gffs:
+            missing_gff = True
+            log.warning("No .gff/.gff3 under %s (requested but not available for this assembly)", label_dir)
+        else:
+            for f in gffs:
+                if f.stat().st_size == 0:
+                    log.warning("Empty file: %s", f)
+    missing_protein = False
+    if include_protein:
+        faas = _collect_protein(dirs)
+        if not faas:
+            missing_protein = True
+            log.warning("No protein FASTA under %s (requested but not available for this assembly)", label_dir)
+        else:
+            for f in faas:
+                if f.stat().st_size == 0:
+                    log.warning("Empty file: %s", f)
+    return True, missing_gff, missing_protein  # Valid if genome FASTA exists and is non-empty
+
+
+def cmd_status(
+    csv_path: Path,
+    config: dict[str, Any],
+    dry_run: bool,
+    log: logging.Logger,
+) -> int:
+    download_root = Path(config["download_root"])
+    rows = read_csv(csv_path)
+    for row in rows:
+        label = row["label"]
+        label_dir = get_label_dir(download_root, label)
+        status = get_status(label_dir, row["include_annotation"], row["include_protein"])
+        log.info("%s\t%s\t%s", label, row["bioproject"], status)
+        print(f"{label}\t{row['bioproject']}\t{status}")
+    return 0
+
+
+def cmd_download(
+    csv_path: Path,
+    config: dict[str, Any],
+    dry_run: bool,
+    log: logging.Logger,
+    use_dehydrated: bool = False,
+) -> int:
+    download_root = Path(config["download_root"])
+    rows = read_csv(csv_path)
+    rehydrate_workers = config.get("rehydrate_workers")
+    assembly_level = config.get("assembly_level")
+    for row in rows:
+        label = row["label"]
+        bioproject = row["bioproject"]
+        label_dir = get_label_dir(download_root, label)
+        assembly_id = row.get("assembly_id", "").strip()
+        wb_species = row.get("wormbase_species", "")
+        wbps_version = config.get("wbps_version", WBPS_DEFAULT_VERSION)
+        skip_wb = config.get("skip_wormbase", False)
+        project_source = detect_project_source(bioproject)
+
+        download_root.mkdir(parents=True, exist_ok=True)
+        wormbase_primary = False
+
+        # --- WormBase ParaSite as primary source when available ---
+        if wb_species and not skip_wb:
+            wbps_dir = find_wormbase_data_dir(label_dir)
+            already_fetched = wbps_dir is not None and any(wbps_dir.iterdir()) if wbps_dir else False
+            if not already_fetched:
+                wbps_types = ["genome"]
+                if row["include_annotation"]:
+                    wbps_types.append("gff3")
+                if row["include_protein"]:
+                    wbps_types.append("protein")
+                log.info("%s: using WormBase ParaSite as primary source for: %s", label, ", ".join(wbps_types))
+                label_dir.mkdir(parents=True, exist_ok=True)
+                download_from_wormbase(wb_species, bioproject, label_dir, wbps_types, dry_run, log, wbps_version)
+            if not dry_run:
+                valid, _, _ = validate_download(label_dir, row["include_annotation"], row["include_protein"], log)
+                if valid:
+                    wormbase_primary = True
+
+        # --- NCBI / ENA fallback (when WormBase unavailable or incomplete) ---
+        if not wormbase_primary:
+            include = build_include(row["include_annotation"], row["include_protein"])
+            zip_name = f"{label}.zip"
+            zip_path = download_root / zip_name
+            accession = assembly_id or bioproject
+            cmd = [
+                DATASETS_CMD, "download", "genome", "accession", accession,
+                "--filename", str(zip_path), "--include", include,
+            ]
+            row_assembly = row.get("assembly_level") or assembly_level
+            if row_assembly:
+                cmd.extend(["--assembly-level", row_assembly])
+            if use_dehydrated:
+                cmd.append("--dehydrated")
+            ncbi_success = run_cmd(cmd, dry_run, log)
+            ena_downloaded = False
+
+            if not ncbi_success and assembly_id:
+                log.info("%s: NCBI download failed, trying ENA download for %s", label, assembly_id)
+                if download_from_ena(assembly_id, label_dir, row["include_annotation"], row["include_protein"], dry_run, log):
+                    log.info("%s: Successfully downloaded from ENA", label)
+                    ena_downloaded = True
+                else:
+                    log.error("Failed to download %s (%s) from all sources; continuing with next row", label, bioproject)
+                    continue
+            elif not ncbi_success:
+                log.error("Failed to download %s (%s); continuing with next row", label, bioproject)
+                continue
+
+            if not ena_downloaded and not dry_run and zip_path.exists():
+                label_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    with zipfile.ZipFile(zip_path, "r") as z:
+                        z.extractall(label_dir)
+                    zip_path.unlink()
+                except (zipfile.BadZipFile, zipfile.LargeZipFile, OSError) as e:
+                    log.error("Failed to extract %s: %s", zip_path, e)
+                    return 1
+            if not ena_downloaded and not dry_run and label_dir.exists() and has_fetch_txt(label_dir):
+                rehydrate_cmd = [DATASETS_CMD, "rehydrate", "--directory", str(label_dir)]
+                if rehydrate_workers is not None:
+                    rehydrate_cmd.extend(["--max-workers", str(rehydrate_workers)])
+                if not run_cmd(rehydrate_cmd, dry_run=False, log=log):
+                    return 1
+
+            # Still try WormBase for annotations/protein after NCBI/ENA
+            if wb_species and not skip_wb and not dry_run:
+                wbps_dir = find_wormbase_data_dir(label_dir)
+                already_fetched = wbps_dir is not None and any(wbps_dir.iterdir()) if wbps_dir else False
+                if not already_fetched:
+                    wbps_types: list[str] = []
+                    if row["include_annotation"]:
+                        wbps_types.append("gff3")
+                    if row["include_protein"]:
+                        wbps_types.append("protein")
+                    if wbps_types:
+                        log.info("%s: supplementing NCBI/ENA download with WormBase annotations", label)
+                        download_from_wormbase(wb_species, bioproject, label_dir, wbps_types, dry_run, log, wbps_version)
+
+        # --- Validate and write manifest ---
+        if not dry_run and label_dir.exists():
+            valid, missing_gff, missing_protein = validate_download(label_dir, row["include_annotation"], row["include_protein"], log)
+            if valid:
+                manifest_data = discover_manifest_paths(label_dir, row["include_protein"])
+                manifest_data["bioproject"] = bioproject
+                manifest_data["label"] = label
+                metadata_fields = ["taxon", "taxon_id", "assembly_id", "assembly_level", "source", "genome_size", "reference",
+                                   "wormbase_species"]
+                for field in metadata_fields:
+                    if field in row and row[field]:
+                        manifest_data[field] = row[field]
+                if missing_gff or missing_protein:
+                    if wb_species:
+                        log.info("%s: some files still missing after WormBase download", label)
+                    elif project_source in ("ENA", "DDBJ"):
+                        log.info("%s: missing files may be available from WormBase ParaSite or ENA FTP", label)
+                write_manifest(label_dir, manifest_data, dry_run=False, log=log)
+            else:
+                log.warning("%s: validation failed (missing required genome FASTA); skipping manifest", label)
+    return 0
+
+
+def cmd_repair(
+    csv_path: Path,
+    config: dict[str, Any],
+    dry_run: bool,
+    log: logging.Logger,
+) -> int:
+    download_root = Path(config["download_root"])
+    rows = read_csv(csv_path)
+    rehydrate_workers = config.get("rehydrate_workers")
+    for row in rows:
+        label = row["label"]
+        label_dir = get_label_dir(download_root, label)
+        status = get_status(label_dir, row["include_annotation"], row["include_protein"])
+        if status != "dehydrated_only" and status != "rehydrated":
+            if status == "not_started":
+                log.info("%s: not_started; run download first", label)
+            else:
+                log.info("%s: %s; skip repair", label, status)
+            continue
+        if not has_fetch_txt(label_dir):
+            log.info("%s: no fetch.txt; run download first", label)
+            continue
+        rehydrate_cmd = [DATASETS_CMD, "rehydrate", "--directory", str(label_dir)]
+        if rehydrate_workers is not None:
+            rehydrate_cmd.extend(["--max-workers", str(rehydrate_workers)])
+        if not run_cmd(rehydrate_cmd, dry_run, log):
+            log.error("Failed to rehydrate %s; continuing with next row", label)
+            continue  # Continue with next row instead of exiting
+        if not dry_run:
+            valid, missing_gff, missing_protein = validate_download(label_dir, row["include_annotation"], row["include_protein"], log)
+
+            wb_species = row.get("wormbase_species", "")
+            wbps_version = config.get("wbps_version", WBPS_DEFAULT_VERSION)
+            skip_wb = config.get("skip_wormbase", False)
+            if wb_species and not skip_wb:
+                wbps_dir = find_wormbase_data_dir(label_dir)
+                already_fetched = wbps_dir is not None and any(wbps_dir.iterdir()) if wbps_dir else False
+                if not already_fetched:
+                    wbps_types = ["genome"]
+                    if row["include_annotation"]:
+                        wbps_types.append("gff3")
+                    if row["include_protein"]:
+                        wbps_types.append("protein")
+                    log.info("%s: fetching WormBase ParaSite data for: %s", label, ", ".join(wbps_types))
+                    download_from_wormbase(wb_species, row["bioproject"], label_dir, wbps_types, dry_run, log, wbps_version)
+                    valid, missing_gff, missing_protein = validate_download(
+                        label_dir, row["include_annotation"], row["include_protein"], log)
+
+            if valid:
+                manifest_data = discover_manifest_paths(label_dir, row["include_protein"])
+                manifest_data["bioproject"] = row["bioproject"]
+                manifest_data["label"] = label
+                metadata_fields = ["taxon", "taxon_id", "assembly_id", "assembly_level", "source", "genome_size", "reference",
+                                   "wormbase_species"]
+                for field in metadata_fields:
+                    if field in row and row[field]:
+                        manifest_data[field] = row[field]
+                write_manifest(label_dir, manifest_data, dry_run=False, log=log)
+    return 0
+
+
+def setup_logging(log_path: Path | None, verbose: bool) -> logging.Logger:
+    log = logging.getLogger("download_genomes")
+    log.setLevel(logging.DEBUG if verbose else logging.INFO)
+    log.handlers.clear()
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    if log_path:
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setFormatter(fmt)
+        log.addHandler(fh)
+    ch = logging.StreamHandler(sys.stderr)
+    ch.setFormatter(fmt)
+    log.addHandler(ch)
+    return log
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Download genomes from NCBI BioProjects (CSV input)")
+    ap.add_argument("--csv", type=Path, default=Path(DEFAULT_CSV), help="Input bioprojects CSV")
+    ap.add_argument("--config", type=Path, default=Path("config.yml"), help="Config YAML (optional)")
+    ap.add_argument("--dry-run", action="store_true", help="Print actions, no writes or downloads")
+    ap.add_argument("--log-file", type=Path, default=Path(LOG_FILE), help="Log file path")
+    ap.add_argument("--no-log-file", action="store_true", help="Do not write log file")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--skip-wormbase", action="store_true",
+                     help="Skip WormBase ParaSite supplement for missing annotations/proteins")
+    sub = ap.add_subparsers(dest="command", required=True)
+    sub.add_parser("status", help="Report status per row (not_started | dehydrated_only | rehydrated | complete)")
+    dl = sub.add_parser("download", help="Download and optionally rehydrate")
+    dl.add_argument("--dehydrated", action="store_true", help="Download dehydrated (then rehydrate)")
+    sub.add_parser("repair", help="Rehydrate where needed (idempotent)")
+    args = ap.parse_args()
+    config = load_config(args.config)
+    if getattr(args, "skip_wormbase", False):
+        config["skip_wormbase"] = True
+    log = setup_logging(None if args.no_log_file else args.log_file, args.verbose)
+    if args.command == "status":
+        return cmd_status(args.csv, config, args.dry_run, log)
+    if args.command == "download":
+        return cmd_download(args.csv, config, args.dry_run, log, getattr(args, "dehydrated", False))
+    if args.command == "repair":
+        return cmd_repair(args.csv, config, args.dry_run, log)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

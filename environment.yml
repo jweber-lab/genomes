@@ -1,0 +1,11 @@
+name: genomes
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python>=3.8
+  - pyyaml>=5.1
+  - ncbi-datasets-cli
+  - enabrowsertools  # Optional: for ENA fallback downloads
+  - blast  # BLAST+ suite

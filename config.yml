@@ -1,0 +1,25 @@
+# Optional config for download_genomes.py and setup_blast_db.py
+# Paths are relative to the current working directory unless absolute.
+
+# Root directory for NCBI dataset downloads (default: downloads)
+download_root: downloads
+
+# Root directory for BLAST databases (default: blast_db)
+blast_db_root: blast_db
+
+# Number of parallel rehydrate workers (datasets rehydrate --max-workers)
+# Omit or null to use NCBI default
+rehydrate_workers: 10
+
+# Optional assembly-level filter for downloads: Complete, Chromosome, Scaffold, Contig
+# assembly_level: Chromosome
+
+# Number of labels to build in parallel for BLAST DB (default: 1)
+build_jobs: 1
+
+# Optional max FASTA size for makeblastdb (e.g. "2GB") for very large genomes
+# max_file_sz: "2GB"
+
+# WormBase ParaSite release version for assembly/annotation/protein downloads
+# See https://ftp.ebi.ac.uk/pub/databases/wormbase/parasite/releases/ for available versions
+wbps_version: WBPS19

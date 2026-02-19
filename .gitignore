@@ -1,6 +1,7 @@
 # Downloaded data and built DBs (large)
 downloads/
 blast_db/
+ssol/
 
 # Sequence files (FASTA, FASTQ)
 *.fa

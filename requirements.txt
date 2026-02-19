@@ -1,0 +1,5 @@
+# Python dependencies (install via: pip install -r requirements.txt)
+# Note: CLI tools (NCBI Datasets, BLAST+, enaBrowserTools) are not Python packages.
+# Use conda environment.yml or install separately (see README.md).
+
+pyyaml>=5.1

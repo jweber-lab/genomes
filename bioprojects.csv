@@ -1,4 +1,6 @@
 bioproject,label,taxon_id,skip,taxon,wormbase_species,doi,assembly_id,assembly_level,genome_size
+PRJEB527,ssol_eb527,70667,false,Schistocephalus solidus,schistocephalus_solidus,,GCA_900618435.1,scaffold,
+PRJNA576252,ssol_na576252,70667,false,Schistocephalus solidus,,10.1186/s13071-021-04933-w,GCA_017591395.1,scaffold,
 PRJNA1055111,lint,94845,false,Ligula intestinalis,,10.1098/rspb.2023.2563,GCA_036362985.1,scaffold,
 PRJDB8966,spro,64606,false,Sparganum proliferum,,10.1093/jhered/esaf104,GCA_053814205.1,chromosome,
 PRJNA754835,egra,6210,false,Echinococcus granulosus,echinococcus_granulosus,10.1038/s42003-022-03125-1,GCA_021556725.1,scaffold,

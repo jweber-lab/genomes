@@ -316,42 +316,69 @@ def _collect_protein(dirs: list[Path | None]) -> list[Path]:
     return faas
 
 
-def get_status(label_dir: Path, include_annotation: bool, include_protein: bool) -> str:
+def get_status(label_dir: Path, include_annotation: bool, include_protein: bool) -> dict[str, Any]:
+    """Check download state for a label directory.
+
+    Returns a dict with keys:
+        status:    not_started | dehydrated | incomplete | complete
+        has_genome, has_gff, has_protein:  bool
+        needs_rehydration:  bool  (fetch.txt present)
+        sources:  list[str]  e.g. ["ncbi", "wormbase"]
+        missing:  list[str]  human-readable list of what's absent
     """
-    Return: not_started | dehydrated_only | rehydrated | complete.
-    complete = genome FASTA (and optionally GFF, protein) present and non-empty.
-    Supports NCBI, ENA, and WormBase ParaSite download structures.
-    """
+    result: dict[str, Any] = {
+        "status": "not_started",
+        "has_genome": False,
+        "has_gff": False,
+        "has_protein": False,
+        "needs_rehydration": False,
+        "sources": [],
+        "missing": [],
+    }
     if not label_dir.exists():
-        return "not_started"
+        return result
+
     data_dir = find_ncbi_data_dir(label_dir)
     ena_dir = find_ena_data_dir(label_dir)
     wbps_dir = find_wormbase_data_dir(label_dir)
-    if data_dir is None and ena_dir is None and wbps_dir is None:
-        if has_fetch_txt(label_dir):
-            return "dehydrated_only"
-        return "rehydrated"
+    if data_dir:
+        result["sources"].append("ncbi")
+    if ena_dir:
+        result["sources"].append("ena")
+    if wbps_dir:
+        result["sources"].append("wormbase")
+
+    result["needs_rehydration"] = has_fetch_txt(label_dir)
+
     dirs: list[Path | None] = [data_dir, ena_dir, wbps_dir]
     fnas = _collect_genome_fasta(dirs)
-    if not fnas:
-        if has_fetch_txt(label_dir):
-            return "dehydrated_only"
-        return "rehydrated"
-    if any(f.stat().st_size == 0 for f in fnas):
-        return "rehydrated"
-    if include_annotation:
-        gffs = _collect_gff(dirs)
-        if not gffs or any(f.stat().st_size == 0 for f in gffs):
-            if has_fetch_txt(label_dir):
-                return "dehydrated_only"
-            return "rehydrated"
-    if include_protein:
-        faas = _collect_protein(dirs)
-        if not faas or any(f.stat().st_size == 0 for f in faas):
-            if has_fetch_txt(label_dir):
-                return "dehydrated_only"
-            return "rehydrated"
-    return "complete"
+    if fnas and all(f.stat().st_size > 0 for f in fnas):
+        result["has_genome"] = True
+    gffs = _collect_gff(dirs)
+    if gffs and all(f.stat().st_size > 0 for f in gffs):
+        result["has_gff"] = True
+    faas = _collect_protein(dirs)
+    if faas and all(f.stat().st_size > 0 for f in faas):
+        result["has_protein"] = True
+
+    if not result["has_genome"]:
+        result["missing"].append("genome")
+        if result["needs_rehydration"]:
+            result["status"] = "dehydrated"
+        elif result["sources"]:
+            result["status"] = "incomplete"
+        return result
+
+    if include_annotation and not result["has_gff"]:
+        result["missing"].append("gff3")
+    if include_protein and not result["has_protein"]:
+        result["missing"].append("protein")
+
+    if result["missing"]:
+        result["status"] = "incomplete"
+    else:
+        result["status"] = "complete"
+    return result
 
 
 def run_cmd(cmd: list[str], dry_run: bool, log: logging.Logger, max_retries: int = 3, retry_delay: int = 5) -> bool:
@@ -660,6 +687,10 @@ def validate_download(label_dir: Path, include_annotation: bool, include_protein
     return True, missing_gff, missing_protein  # Valid if genome FASTA exists and is non-empty
 
 
+def _yn(val: bool) -> str:
+    return "yes" if val else "-"
+
+
 def cmd_status(
     csv_path: Path,
     config: dict[str, Any],
@@ -668,12 +699,28 @@ def cmd_status(
 ) -> int:
     download_root = Path(config["download_root"])
     rows = read_csv(csv_path)
+    header = f"{'label':<16}{'bioproject':<16}{'status':<14}{'genome':<8}{'gff3':<8}{'protein':<8}{'sources'}"
+    print(header)
+    print("-" * len(header))
     for row in rows:
         label = row["label"]
         label_dir = get_label_dir(download_root, label)
-        status = get_status(label_dir, row["include_annotation"], row["include_protein"])
-        log.info("%s\t%s\t%s", label, row["bioproject"], status)
-        print(f"{label}\t{row['bioproject']}\t{status}")
+        st = get_status(label_dir, row["include_annotation"], row["include_protein"])
+        status_str = st["status"]
+        if st["missing"] and st["status"] == "incomplete":
+            status_str = f"incomplete"
+        sources = ",".join(st["sources"]) if st["sources"] else "-"
+        line = (f"{label:<16}{row['bioproject']:<16}{status_str:<14}"
+                f"{_yn(st['has_genome']):<8}{_yn(st['has_gff']):<8}{_yn(st['has_protein']):<8}"
+                f"{sources}")
+        print(line)
+        log.debug("%s", line)
+    # Orphaned directories
+    active = {row["label"] for row in rows}
+    if download_root.is_dir():
+        for child in sorted(download_root.iterdir()):
+            if child.is_dir() and child.name not in active:
+                print(f"{child.name:<16}{'':<16}{'orphaned':<14}{'-':<8}{'-':<8}{'-':<8}-")
     return 0
 
 
@@ -739,9 +786,9 @@ def cmd_download(
         active_labels.add(label)
 
         # --- Check existing state before downloading ---
-        status = get_status(label_dir, row["include_annotation"], row["include_protein"])
+        st = get_status(label_dir, row["include_annotation"], row["include_protein"])
 
-        if status == "complete" and not force:
+        if st["status"] == "complete" and not force:
             existing = _read_manifest(label_dir)
             old_asm = (existing.get("assembly_id") or "").strip() if existing else ""
             if assembly_id and old_asm and assembly_id != old_asm:
@@ -898,51 +945,65 @@ def cmd_repair(
     dry_run: bool,
     log: logging.Logger,
 ) -> int:
+    """Rehydrate dehydrated downloads and supplement with WormBase where needed."""
     download_root = Path(config["download_root"])
     rows = read_csv(csv_path)
     rehydrate_workers = config.get("rehydrate_workers")
+    summaries: list[str] = []
+
     for row in rows:
         label = row["label"]
+        bioproject = row["bioproject"]
         label_dir = get_label_dir(download_root, label)
-        status = get_status(label_dir, row["include_annotation"], row["include_protein"])
-        if status != "dehydrated_only" and status != "rehydrated":
-            if status == "not_started":
-                log.info("%s: not_started; run download first", label)
-            else:
-                log.info("%s: %s; skip repair", label, status)
+        st = get_status(label_dir, row["include_annotation"], row["include_protein"])
+
+        if st["status"] == "not_started":
+            log.info("%s: not_started; run download first", label)
+            summaries.append(f"{label}\t{bioproject}\tskipped (not_started)")
             continue
-        if not has_fetch_txt(label_dir):
-            log.info("%s: no fetch.txt; run download first", label)
+        if st["status"] == "complete":
+            log.info("%s: already complete; nothing to repair", label)
+            summaries.append(f"{label}\t{bioproject}\tskipped (complete)")
             continue
-        rehydrate_cmd = [DATASETS_CMD, "rehydrate", "--directory", str(label_dir)]
-        if rehydrate_workers is not None:
-            rehydrate_cmd.extend(["--max-workers", str(rehydrate_workers)])
-        if not run_cmd(rehydrate_cmd, dry_run, log):
-            log.error("Failed to rehydrate %s; continuing with next row", label)
-            continue  # Continue with next row instead of exiting
+
+        repaired = False
+
+        # Rehydrate if needed
+        if st["needs_rehydration"]:
+            rehydrate_cmd = [DATASETS_CMD, "rehydrate", "--directory", str(label_dir)]
+            if rehydrate_workers is not None:
+                rehydrate_cmd.extend(["--max-workers", str(rehydrate_workers)])
+            if not run_cmd(rehydrate_cmd, dry_run, log):
+                log.error("Failed to rehydrate %s; continuing with next row", label)
+                summaries.append(f"{label}\t{bioproject}\tFAILED (rehydration)")
+                continue
+            repaired = True
+
+        # Supplement with WormBase if incomplete
+        wb_species = row.get("wormbase_species", "")
+        wbps_version = config.get("wbps_version", WBPS_DEFAULT_VERSION)
+        skip_wb = config.get("skip_wormbase", False)
+        if wb_species and not skip_wb and not dry_run:
+            wbps_types: list[str] = []
+            if row["include_annotation"] and not st["has_gff"]:
+                wbps_types.append("gff3")
+            if row["include_protein"] and not st["has_protein"]:
+                wbps_types.append("protein")
+            if not st["has_genome"]:
+                wbps_types.insert(0, "genome")
+            if wbps_types:
+                wbps_dir = find_wormbase_data_dir(label_dir)
+                if not _wbps_download_complete(wbps_dir, wb_species, bioproject, wbps_version, wbps_types):
+                    log.info("%s: fetching WormBase ParaSite data for: %s", label, ", ".join(wbps_types))
+                    download_from_wormbase(wb_species, bioproject, label_dir, wbps_types, dry_run, log, wbps_version)
+                    repaired = True
+
+        # Re-validate and write manifest
         if not dry_run:
             valid, missing_gff, missing_protein = validate_download(label_dir, row["include_annotation"], row["include_protein"], log)
-
-            wb_species = row.get("wormbase_species", "")
-            wbps_version = config.get("wbps_version", WBPS_DEFAULT_VERSION)
-            skip_wb = config.get("skip_wormbase", False)
-            if wb_species and not skip_wb:
-                wbps_dir = find_wormbase_data_dir(label_dir)
-                already_fetched = wbps_dir is not None and any(wbps_dir.iterdir()) if wbps_dir else False
-                if not already_fetched:
-                    wbps_types = ["genome"]
-                    if row["include_annotation"]:
-                        wbps_types.append("gff3")
-                    if row["include_protein"]:
-                        wbps_types.append("protein")
-                    log.info("%s: fetching WormBase ParaSite data for: %s", label, ", ".join(wbps_types))
-                    download_from_wormbase(wb_species, row["bioproject"], label_dir, wbps_types, dry_run, log, wbps_version)
-                    valid, missing_gff, missing_protein = validate_download(
-                        label_dir, row["include_annotation"], row["include_protein"], log)
-
             if valid:
                 manifest_data = discover_manifest_paths(label_dir, row["include_protein"])
-                manifest_data["bioproject"] = row["bioproject"]
+                manifest_data["bioproject"] = bioproject
                 manifest_data["label"] = label
                 metadata_fields = ["taxon", "taxon_id", "assembly_id", "assembly_level", "source", "genome_size", "reference",
                                    "wormbase_species"]
@@ -950,6 +1011,25 @@ def cmd_repair(
                     if field in row and row[field]:
                         manifest_data[field] = row[field]
                 write_manifest(label_dir, manifest_data, dry_run=False, log=log)
+                missing = []
+                if missing_gff:
+                    missing.append("gff3")
+                if missing_protein:
+                    missing.append("protein")
+                action = "repaired" if repaired else "unchanged"
+                if missing:
+                    summaries.append(f"{label}\t{bioproject}\t{action} (missing {', '.join(missing)})")
+                else:
+                    summaries.append(f"{label}\t{bioproject}\t{action} (complete)")
+            else:
+                summaries.append(f"{label}\t{bioproject}\tFAILED (no genome FASTA)")
+
+    if summaries:
+        print()
+        print("label\tbioproject\tresult")
+        for s in summaries:
+            print(s)
+
     return 0
 
 

@@ -101,10 +101,30 @@ __pycache__/
 .eggs/
 *.pyc
 
-# Editor / OS
+# --- OS and filesystem quirks (Windows / macOS / Linux) ---
+# macOS
 .DS_Store
-*.swp
+.AppleDouble
+.LSOverride
+._*
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+# Linux / generic
 *~
+.nfs*
+*.swp
+*.swo
+.directory
+# Cross-platform
+*.bak
+*.tmp
+.Trash-*
+
+# Editor
 .vscode/
 .idea/
 .cursor/

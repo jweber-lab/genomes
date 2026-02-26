@@ -1,9 +1,46 @@
 #!/usr/bin/env python3
 """
-Set up and manage local BLAST databases from downloaded genomes.
-Subcommands: build, update, list.
-Builds nucl (blastn/tblastn) and optional prot (blastp/blastx) DBs per label.
-Writes blast_db/registry.yaml. Supports --dry-run, --alias, parallel builds, validation, idempotent rebuild.
+setup_blast_db.py — Build and manage local BLAST databases from downloaded
+genome assemblies, annotations, and protein sequences.
+
+Example
+-------
+    python setup_blast_db.py --csv bioprojects.csv build --alias
+    python setup_blast_db.py --csv bioprojects.csv --dry-run build
+    python setup_blast_db.py --csv bioprojects.csv update --alias
+    python setup_blast_db.py --csv bioprojects.csv alias
+    python setup_blast_db.py --csv bioprojects.csv list
+
+Subcommands
+-----------
+  build   Build nucleotide and protein BLAST databases for every non-skipped
+          row in the CSV. Optionally create combined alias databases with
+          --alias.
+  update  Identical to build — rebuilds all databases from current downloads.
+  alias   Create alias databases (all_nucl, all_prot) from existing per-label
+          databases without rebuilding anything.
+  list    Print the contents of blast_db/registry.yaml.
+
+Workflow (build)
+----------------
+  1. Read bioprojects.csv; skip rows where skip=true.
+  2. For each label, locate genome FASTA, GFF3, and protein FASTA files in the
+     downloads directory. Searches WormBase ParaSite, NCBI, and ENA
+     subdirectories in that order, so WormBase's curated files take priority
+     when present. Prefers manifest.json paths if available.
+  3. Concatenate genome FASTAs and run makeblastdb to create a nucleotide
+     database (blast_db/<label>/nucl/). Copy the first GFF3 alongside it.
+  4. If protein FASTAs are found, concatenate and run makeblastdb to create a
+     protein database (blast_db/<label>/prot/).
+  5. If --alias is set, create combined alias databases (all_nucl, all_prot)
+     using blastdb_aliastool so all genomes can be searched in a single query.
+  6. Write blast_db/registry.yaml with paths, metadata, and supported BLAST
+     programs for each database. Downstream pipelines read this registry.
+
+Builds can run in parallel across labels (set build_jobs in config.yml).
+
+Dependencies: BLAST+ suite (makeblastdb, blastdbcmd, blastdb_aliastool),
+PyYAML (optional, falls back to JSON for registry).
 """
 
 from __future__ import annotations

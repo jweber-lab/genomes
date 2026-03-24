@@ -2,14 +2,17 @@
 
 This repository is the single source of truth for **which genomes we have** and **how to BLAST against them** (with annotations). It provides:
 
-1. **Download script** — Check status, download, and repair genome data from NCBI BioProjects (input CSV). Automatically falls back to ENA download for ENA/DDBJ projects when NCBI download fails. Supplements missing annotations and proteins from [WormBase ParaSite](https://parasite.wormbase.org/) when configured.
+1. **Download script** — Check status, download, and repair genome data from NCBI BioProjects (input CSV). Automatically falls back to ENA download for ENA/DDBJ projects when NCBI download fails. Supplements missing annotations, proteins, and coding DNA sequences from [WormBase ParaSite](https://parasite.wormbase.org/) when configured.
 2. **BLAST DB script** — Build and manage local BLAST databases (nucleotide and optional protein) and a **registry** for downstream pipelines.
 
 Downstream scripts (e.g. poolseq annotation) read the registry and run BLAST against these DBs; they adapt to this repo’s interface.
 
 ---
+**Manual options**: If this script is not working, or a manual alternative is preferred, the same datasets can be downloaded by browsing the assembly on [WormBase ParaSite](https://parasite.wormbase.org/) via the [WormBase ParaSite FTP](https://ftp.ebi.ac.uk/pub/databases/wormbase/parasite/), [ENA](https://www.ebi.ac.uk/ena/browser/home) or [NCBI](https://www.ncbi.nlm.nih.gov/datasets/); if unavailable, a CDS fasta can be derived from genome + GFF with [gffread](http://ccb.jhu.edu/software/stringtie/gff.shtml#gffread) or similar.
 
-## Install
+---
+
+## Installing Dependencies
 
 ### Option 1: Conda (recommended)
 
@@ -17,7 +20,7 @@ Create a conda environment with all dependencies:
 
 ```bash
 conda env create -f environment.yml
-conda activate genomes
+conda activate genome-dl
 ```
 
 This installs:
@@ -58,7 +61,7 @@ One row per NCBI BioProject. Columns:
 | `taxon_id`           | No       | NCBI taxonomy ID (e.g. `94845`) — stored in manifest and registry |
 | `skip`               | No       | `true`/`false`; skip this row (default: false) — rows with `skip=true` are ignored |
 | `taxon`              | No       | Scientific name (e.g. `Ligula intestinalis`) — stored in manifest and registry |
-| `wormbase_species`   | No       | WormBase ParaSite species key (e.g. `hymenolepis_microstoma`). When set, the script automatically downloads curated annotations and proteins from WormBase ParaSite FTP for this bioproject |
+| `wormbase_species`   | No       | WormBase ParaSite species key (e.g. `hymenolepis_microstoma`). When set, the script automatically downloads curated genome, annotations (GFF3), proteins, and coding DNA sequences (`CDS_transcripts.fa`) from WormBase ParaSite FTP for this bioproject |
 | `doi`                | No       | Publication DOI (e.g. `10.1234/example`) |
 | `assembly_id`        | No       | Specific assembly accession (e.g. `GCA_036362985.1`) — if provided, used for download instead of bioproject (more specific) |
 | `assembly_level`     | No       | Filter: `Complete`, `Chromosome`, `Scaffold`, `Contig` |
@@ -79,7 +82,10 @@ PRJEB124,hmic,85433,false,Hymenolepis microstoma,hymenolepis_microstoma,10.1038/
 - **Multiple assemblies per species:** Add each bioproject as a separate row. Set `skip=true` for alternative assemblies you don't actively use. This keeps a record of available options.
 - Use `fetch_assembly_metadata.py` to attempt auto-filling `genome_size` and `reference` from NCBI (may require manual updates if API doesn't return data).
 - **ENA/DDBJ projects**: BioProjects starting with `PRJEB` (ENA) or `PRJDB` (DDBJ) are automatically detected. If NCBI download fails for these projects and `assembly_id` is provided, the script automatically attempts an ENA download using `enaBrowserTools`. ENA downloads may not include GFF/protein files; check ENA FTP if needed.
-- **WormBase ParaSite**: When `wormbase_species` is set, WormBase ParaSite is the **primary data source**. The script downloads the genome assembly, curated annotations (GFF3), and proteins from the [WormBase ParaSite FTP](https://ftp.ebi.ac.uk/pub/databases/wormbase/parasite/) using the row's own `bioproject`. NCBI/ENA is only used as a fallback if WormBase doesn't provide a complete set. Only set `wormbase_species` for bioprojects that exist on WormBase ParaSite — if the bioproject doesn't match, the annotations won't correspond to the assembly. Use `--skip-wormbase` to disable. Set `wbps_version` in `config.yml` to target a specific WormBase release (default: `WBPS19`).
+- **WormBase ParaSite**: When `wormbase_species` is set, WormBase ParaSite is the **primary data source**. The script downloads the genome assembly, curated annotations (GFF3), proteins, and coding DNA sequences from the [WormBase ParaSite FTP](https://ftp.ebi.ac.uk/pub/databases/wormbase/parasite/) using the row's own `bioproject`. NCBI/ENA is only used as a fallback if WormBase doesn't provide a complete set. Only set `wormbase_species` for bioprojects that exist on WormBase ParaSite — if the bioproject doesn't match, the annotations won't correspond to the assembly. Use `--skip-wormbase` to disable. Set `wbps_version` in `config.yml` to target a specific WormBase release (default: `WBPS19`).
+- **Annotation Retrieval**: Default sequence path search includes `gff`, `protein_fasta`, and `cds_fasta`, attempting to retrieve these in addition to the `genome_fasta`.
+  - **Protein FASTA**: NCBI Datasets requests include protein files alongside genome data. The ENA/GenBank FTP fallback also tries `*_protein.fa` when present; the script logs a hint and `status` / validation warn if protein fasta was requested but not found.
+  - **CDS (nucleotide) FASTA**: NCBI Datasets requests include `cds` alongside genome, gff3, and protein (when enabled). The ENA/GenBank FTP fallback also tries `*_cds_from_genomic.fna.gz` when present, though ENA contig-level downloads and some assemblies may not ship CDS FASTA through these paths; the script logs a hint and `status` / validation warn if CDS was requested but not found.
 
 ---
 
@@ -123,7 +129,7 @@ Use `--config config.yml` for `blast_db_root`, `build_jobs`, etc. Use `--dry-run
 ## Directory layout
 
 - `downloads/<label>/` — NCBI dataset (unzipped); `manifest.json` written after download/repair.
-- `downloads/<label>/wormbase_parasite/` — Supplementary files from WormBase ParaSite (annotations, proteins).
+- `downloads/<label>/wormbase_parasite/` — Supplementary files from WormBase ParaSite (annotations, proteins, CDS transcripts, etc.).
 - `blast_db/<label>/nucl/` — Nucleotide DB (blastn, tblastn) and `annotations.gff`.
 - `blast_db/<label>/prot/` — Protein DB (blastp, blastx).
 - `blast_db/registry.yaml` — **Consumer contract**: list of DBs and how to use them.
@@ -336,5 +342,6 @@ The scripts preserve any extra columns in the CSV. Consider adding these fields 
 | `download_url`     | Alternative download URL (if not using NCBI datasets) |
 | `include_annotation` | `true`/`false`; request GFF (default: true) — only needed to disable annotations for a specific row |
 | `include_protein`    | `true`/`false`; request protein FASTA (default: true) — only needed to disable proteins for a specific row |
+| `include_cds`        | `true`/`false`; request CDS nucleotide FASTA (default: true) — disable per row if you only want genome + annotations |
 
 **Note:** Currently, these fields are preserved in the CSV row dict but not automatically stored in `manifest.json` or `registry.yaml`. To include them, modify the scripts to copy them (similar to how `taxon`, `taxon_id`, `assembly_id` are handled).

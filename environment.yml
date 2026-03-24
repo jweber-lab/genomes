@@ -1,4 +1,4 @@
-name: genomes
+name: genome-dl
 channels:
   - conda-forge
   - bioconda

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-download_genomes.py — Download and manage genome assemblies, annotations, and
-protein sequences for a set of BioProjects defined in a CSV manifest.
+download_genomes.py — Download and manage genome assemblies, annotations,
+protein sequences, and CDS nucleotide FASTA for a set of BioProjects in a CSV 
+manifest.
 
 Example
 -------
@@ -13,8 +14,9 @@ Example
 
 Subcommands
 -----------
-  status    Report per-row download state (not_started / dehydrated_only /
-            rehydrated / complete).
+  status    Report per-bioproject-row download state (not_started / 
+            dehydrated_only / rehydrated / complete), along with genome / 
+            gff3 / protein / cds columns and data sources.
   download  Fetch genome data for every non-skipped row. Writes a manifest.json
             in each label directory on success. Already-complete labels are
             skipped unless --force is given. Prints a summary table at the end.
@@ -29,11 +31,11 @@ Workflow (download)
        (prevents silently mixing old and new data; use --force to override).
      - Remove any stale .zip from a prior interrupted run.
   3. Resolve the data source:
-     a. If wormbase_species is set, try WormBase ParaSite first — download the
-        genome FASTA, GFF3 annotations, and protein FASTA from the WormBase FTP
-        (release controlled by wbps_version in config.yml, default WBPS19).
-        Checks that all expected files are present, not just that the directory
-        is non-empty (handles partial downloads from prior interrupted runs).
+     a. If wormbase_species is set, try WormBase ParaSite first — download
+        genome, GFF3, protein, and CDS transcripts FASTA from the WormBase FTP
+        (wbps_version in config.yml, default WBPS19). Verifies expected files
+        are present (not just a non-empty directory, handles partial downloads
+        from prior interrupted runs).
      b. If WormBase provides a complete set, use it as the primary source.
      c. Otherwise fall back to NCBI Datasets CLI (ncbi-datasets-cli). If NCBI
         fails and an assembly_id is available, attempt an ENA download via
@@ -41,9 +43,9 @@ Workflow (download)
      d. After NCBI/ENA download, if wormbase_species is set and WormBase data
         was not already fetched, supplement with WormBase annotations/proteins.
   4. Extract and (if dehydrated) rehydrate NCBI ZIP archives.
-  5. Validate that required files are present (genome FASTA at minimum).
-  6. Write downloads/<label>/manifest.json with discovered file paths and
-     metadata (taxon, assembly_id, source, etc.).
+  5. Validate (genome required; missing gff3/protein/cds files will give a 
+     warning if requested but absent).
+  6. Write manifest.json with biosample metadata and downloaded file paths.
   7. Warn about orphaned download directories not in the current CSV.
   8. Print a per-row summary table to stdout.
 
@@ -240,6 +242,8 @@ def read_csv(csv_path: Path) -> list[dict[str, str]]:
             r["include_annotation"] = inc_ann in ("true", "1", "yes")
             inc_prot = (r.get("include_protein") or "true").strip().lower()
             r["include_protein"] = inc_prot in ("true", "1", "yes")
+            inc_cds = (r.get("include_cds") or "true").strip().lower()
+            r["include_cds"] = inc_cds in ("true", "1", "yes")
             r["wormbase_species"] = (r.get("wormbase_species") or "").strip()
             rows.append(r)
     return rows
@@ -283,16 +287,52 @@ def find_ena_data_dir(label_dir: Path) -> Path | None:
 
 
 
+def _is_cds_nucleotide_fasta(path: Path) -> bool:
+    """True if path looks like a CDS (nucleotide) FASTA, not genome or protein."""
+    name = path.name.lower()
+    if path.suffix.lower() == ".faa":
+        return False
+    if "protein" in name:
+        return False
+    return "cds" in name
+
+
 def _collect_genome_fasta(dirs: list[Path | None]) -> list[Path]:
     """Collect genome FASTA files from NCBI, ENA, and WormBase data directories."""
     fnas: list[Path] = []
     for d in dirs:
         if d is None:
             continue
-        fnas.extend(list(d.rglob("*.fna")))
-        fnas.extend([f for f in d.rglob("*.fa") if "protein" not in f.name.lower()])
-        fnas.extend([f for f in d.rglob("*.fasta") if "protein" not in f.name.lower()])
+        for f in d.rglob("*.fna"):
+            if not _is_cds_nucleotide_fasta(f):
+                fnas.append(f)
+        fnas.extend(
+            f for f in d.rglob("*.fa")
+            if "protein" not in f.name.lower() and not _is_cds_nucleotide_fasta(f)
+        )
+        fnas.extend(
+            f for f in d.rglob("*.fasta")
+            if "protein" not in f.name.lower() and not _is_cds_nucleotide_fasta(f)
+        )
     return fnas
+
+
+def _collect_cds(dirs: list[Path | None]) -> list[Path]:
+    """Collect CDS nucleotide FASTA (e.g. cds_from_genomic.fna, CDS_transcripts.fa)."""
+    out: list[Path] = []
+    for d in dirs:
+        if d is None:
+            continue
+        for f in d.rglob("*.fna"):
+            if f.is_file() and f.stat().st_size > 0 and _is_cds_nucleotide_fasta(f):
+                out.append(f)
+        for f in d.rglob("*.fa"):
+            if f.is_file() and f.stat().st_size > 0 and _is_cds_nucleotide_fasta(f):
+                out.append(f)
+        for f in d.rglob("*.fasta"):
+            if f.is_file() and f.stat().st_size > 0 and _is_cds_nucleotide_fasta(f):
+                out.append(f)
+    return out
 
 
 def _collect_gff(dirs: list[Path | None]) -> list[Path]:
@@ -316,12 +356,17 @@ def _collect_protein(dirs: list[Path | None]) -> list[Path]:
     return faas
 
 
-def get_status(label_dir: Path, include_annotation: bool, include_protein: bool) -> dict[str, Any]:
+def get_status(
+    label_dir: Path,
+    include_annotation: bool,
+    include_protein: bool,
+    include_cds: bool,
+) -> dict[str, Any]:
     """Check download state for a label directory.
 
     Returns a dict with keys:
         status:    not_started | dehydrated | incomplete | complete
-        has_genome, has_gff, has_protein:  bool
+        has_genome, has_gff, has_protein, has_cds:  bool
         needs_rehydration:  bool  (fetch.txt present)
         sources:  list[str]  e.g. ["ncbi", "wormbase"]
         missing:  list[str]  human-readable list of what's absent
@@ -331,6 +376,7 @@ def get_status(label_dir: Path, include_annotation: bool, include_protein: bool)
         "has_genome": False,
         "has_gff": False,
         "has_protein": False,
+        "has_cds": False,
         "needs_rehydration": False,
         "sources": [],
         "missing": [],
@@ -360,6 +406,9 @@ def get_status(label_dir: Path, include_annotation: bool, include_protein: bool)
     faas = _collect_protein(dirs)
     if faas and all(f.stat().st_size > 0 for f in faas):
         result["has_protein"] = True
+    cdss = _collect_cds(dirs)
+    if cdss and all(f.stat().st_size > 0 for f in cdss):
+        result["has_cds"] = True
 
     if not result["has_genome"]:
         result["missing"].append("genome")
@@ -373,6 +422,8 @@ def get_status(label_dir: Path, include_annotation: bool, include_protein: bool)
         result["missing"].append("gff3")
     if include_protein and not result["has_protein"]:
         result["missing"].append("protein")
+    if include_cds and not result["has_cds"]:
+        result["missing"].append("cds")
 
     if result["missing"]:
         result["status"] = "incomplete"
@@ -417,12 +468,14 @@ def run_cmd(cmd: list[str], dry_run: bool, log: logging.Logger, max_retries: int
     return False
 
 
-def build_include(include_annotation: bool, include_protein: bool) -> str:
+def build_include(include_annotation: bool, include_protein: bool, include_cds: bool) -> str:
     parts = ["genome"]
     if include_annotation:
         parts.append("gff3")
     if include_protein:
         parts.append("protein")
+    if include_cds:
+        parts.append("cds")
     return ",".join(parts)
 
 
@@ -533,8 +586,12 @@ def download_from_ena_ftp(
         pattern = re.compile(rf'href="({re.escape(assembly_id)}[^"/]*)/?"', re.IGNORECASE)
         matches = pattern.findall(listing)
         for subdir in matches:
-            for suffix in (f"{subdir}_genomic.fna.gz", f"{subdir}_protein.faa.gz",
-                           f"{subdir}_genomic.gff.gz"):
+            for suffix in (
+                f"{subdir}_genomic.fna.gz",
+                f"{subdir}_cds_from_genomic.fna.gz",
+                f"{subdir}_protein.faa.gz",
+                f"{subdir}_genomic.gff.gz",
+            ):
                 file_url = f"{ncbi_dir_url}{subdir}/{suffix}"
                 dest = label_dir / suffix
                 log.info("Trying NCBI FTP: %s", file_url)
@@ -557,6 +614,7 @@ def download_from_ena(
     label_dir: Path,
     include_annotation: bool,
     include_protein: bool,
+    include_cds: bool
     dry_run: bool,
     log: logging.Logger,
 ) -> bool:
@@ -595,10 +653,16 @@ def download_from_ena(
     return False
 
 
-def discover_manifest_paths(label_dir: Path, include_protein: bool) -> dict[str, list[str]]:
-    """Discover paths to genome FASTA, GFF, and optionally protein FASTA.
+def discover_manifest_paths(
+    label_dir: Path,
+    include_protein: bool,
+    include_cds: bool,
+) -> dict[str, list[str]]:
+    """Discover paths to genome FASTA, GFF, optional protein and CDS FASTA.
     Supports NCBI, ENA, and WormBase ParaSite download structures."""
-    out: dict[str, list[str]] = {"genome_fasta": [], "gff": [], "protein_fasta": []}
+    out: dict[str, list[str]] = {
+        "genome_fasta": [], "gff": [], "protein_fasta": [], "cds_fasta": [],
+    }
     seen: set[str] = set()
 
     def _add(key: str, path: Path) -> None:
@@ -613,17 +677,25 @@ def discover_manifest_paths(label_dir: Path, include_protein: bool) -> dict[str,
             continue
         for f in d.rglob("*.fna"):
             if f.is_file() and f.stat().st_size > 0:
-                _add("genome_fasta", f)
+                if include_cds and _is_cds_nucleotide_fasta(f):
+                    _add("cds_fasta", f)
+                elif not _is_cds_nucleotide_fasta(f):
+                    _add("genome_fasta", f)
         for f in d.rglob("*.fa"):
             if f.is_file() and f.stat().st_size > 0:
                 if "protein" in f.name.lower():
                     if include_protein:
                         _add("protein_fasta", f)
+                elif include_cds and _is_cds_nucleotide_fasta(f):
+                    _add("cds_fasta", f)
                 else:
                     _add("genome_fasta", f)
         for f in d.rglob("*.fasta"):
             if f.is_file() and f.stat().st_size > 0 and "protein" not in f.name.lower():
-                _add("genome_fasta", f)
+                if include_cds and _is_cds_nucleotide_fasta(f):
+                    _add("cds_fasta", f)
+                elif not _is_cds_nucleotide_fasta(f):
+                    _add("genome_fasta", f)
         for f in d.rglob("*.faa"):
             if f.is_file() and f.stat().st_size > 0 and include_protein:
                 _add("protein_fasta", f)
@@ -646,24 +718,30 @@ def write_manifest(label_dir: Path, manifest_data: dict, dry_run: bool, log: log
         raise
 
 
-def validate_download(label_dir: Path, include_annotation: bool, include_protein: bool, log: logging.Logger) -> tuple[bool, bool, bool]:
+def validate_download(
+    label_dir: Path,
+    include_annotation: bool,
+    include_protein: bool,
+    include_cds: bool,
+    log: logging.Logger,
+) -> tuple[bool, bool, bool, bool]:
     """
-    Check expected files exist and have size > 0. Returns (valid, missing_gff, missing_protein).
-    Genome FASTA is required; GFF and protein are optional (warn if missing but requested).
-    Supports NCBI, ENA, and WormBase ParaSite download structures.
+    Check expected files exist and have size > 0.
+    Returns (valid, missing_gff, missing_protein, missing_cds).
+    Genome FASTA is required; GFF, protein, and CDS are optional (warn if missing but requested).
     """
     dirs: list[Path | None] = [find_ncbi_data_dir(label_dir), find_ena_data_dir(label_dir), find_wormbase_data_dir(label_dir)]
     if all(d is None for d in dirs):
         log.warning("No ncbi_dataset/data, ENA, or WormBase download dir under %s", label_dir)
-        return False, False, False
+        return False, False, False, False
     fnas = _collect_genome_fasta(dirs)
     if not fnas:
         log.warning("No genome FASTA files under %s", label_dir)
-        return False, False, False
+        return False, False, False, False
     for f in fnas:
         if f.stat().st_size == 0:
             log.warning("Empty file: %s", f)
-            return False, False, False
+            return False, False, False, False
     missing_gff = False
     if include_annotation:
         gffs = _collect_gff(dirs)
@@ -684,7 +762,20 @@ def validate_download(label_dir: Path, include_annotation: bool, include_protein
             for f in faas:
                 if f.stat().st_size == 0:
                     log.warning("Empty file: %s", f)
-    return True, missing_gff, missing_protein  # Valid if genome FASTA exists and is non-empty
+    missing_cds = False
+    if include_cds:
+        cdss = _collect_cds(dirs)
+        if not cdss:
+            missing_cds = True
+            log.warning(
+                "No CDS nucleotide FASTA under %s (requested but not available for this assembly).",
+                label_dir,
+            )
+        else:
+            for f in cdss:
+                if f.stat().st_size == 0:
+                    log.warning("Empty file: %s", f)
+    return True, missing_gff, missing_protein, missing_cds # Valid (True) if genome FASTA exists and is non-empty
 
 
 def _yn(val: bool) -> str:
@@ -699,20 +790,23 @@ def cmd_status(
 ) -> int:
     download_root = Path(config["download_root"])
     rows = read_csv(csv_path)
-    header = f"{'label':<16}{'bioproject':<16}{'status':<14}{'genome':<8}{'gff3':<8}{'protein':<8}{'sources'}"
+    header = (
+        f"{'label':<16}{'bioproject':<16}{'status':<14}{'genome':<8}{'gff3':<8}"
+        f"{'protein':<8}{'cds':<8}{'sources'}"
+    )
     print(header)
     print("-" * len(header))
     for row in rows:
         label = row["label"]
         label_dir = get_label_dir(download_root, label)
-        st = get_status(label_dir, row["include_annotation"], row["include_protein"])
+        st = get_status(
+            label_dir, row["include_annotation"], row["include_protein"], row["include_cds"],
+        )
         status_str = st["status"]
-        if st["missing"] and st["status"] == "incomplete":
-            status_str = f"incomplete"
         sources = ",".join(st["sources"]) if st["sources"] else "-"
         line = (f"{label:<16}{row['bioproject']:<16}{status_str:<14}"
                 f"{_yn(st['has_genome']):<8}{_yn(st['has_gff']):<8}{_yn(st['has_protein']):<8}"
-                f"{sources}")
+                f"{_yn(st['has_cds']):<8}{sources}")
         print(line)
         log.debug("%s", line)
     # Orphaned directories
@@ -720,7 +814,7 @@ def cmd_status(
     if download_root.is_dir():
         for child in sorted(download_root.iterdir()):
             if child.is_dir() and child.name not in active:
-                print(f"{child.name:<16}{'':<16}{'orphaned':<14}{'-':<8}{'-':<8}{'-':<8}-")
+                print(f"{child.name:<16}{'':<16}{'orphaned':<14}{'-':<8}{'-':<8}{'-':<8}{'-':<8}-")
     return 0
 
 
@@ -786,7 +880,9 @@ def cmd_download(
         active_labels.add(label)
 
         # --- Check existing state before downloading ---
-        st = get_status(label_dir, row["include_annotation"], row["include_protein"])
+        st = get_status(
+            label_dir, row["include_annotation"], row["include_protein"], row["include_cds"],
+        )
 
         if st["status"] == "complete" and not force:
             existing = _read_manifest(label_dir)
@@ -799,6 +895,24 @@ def cmd_download(
             log.info("%s: already complete; skipping (use --force to re-download)", label)
             summaries.append(f"{label}\t{bioproject}\tskipped (complete)")
             continue
+
+        # # CDS is often absent from NCBI/ENA for some assemblies; avoid re-downloading every run
+        # if (
+        #     not force
+        #     and st["status"] == "incomplete"
+        #     and st["has_genome"]
+        #     and st.get("missing") == ["cds"]
+        #     and row["include_cds"]
+        #     and _read_manifest(label_dir)
+        # ):
+        #     log.info(
+        #         "%s: skipping re-download (CDS FASTA still absent; not supplied by current sources). "
+        #         "Options: set wormbase_species for WormBase CDS_transcripts.fa, add CDS manually, "
+        #         "set include_cds=false for this row, or use --force.",
+        #         label,
+        #     )
+        #     summaries.append(f"{label}\t{bioproject}\tskipped (no CDS from source)")
+        #     continue
 
         # --- Clean up stale ZIP from a previous interrupted run ---
         zip_path = download_root / f"{label}.zip"
@@ -817,6 +931,8 @@ def cmd_download(
                 wbps_types.append("gff3")
             if row["include_protein"]:
                 wbps_types.append("protein")
+            if row["include_cds"]:
+                wbps_types.append("cds_transcripts")
             wbps_dir = find_wormbase_data_dir(label_dir)
             if _wbps_download_complete(wbps_dir, wb_species, bioproject, wbps_version, wbps_types):
                 log.info("%s: WormBase files already present", label)
@@ -825,13 +941,17 @@ def cmd_download(
                 label_dir.mkdir(parents=True, exist_ok=True)
                 download_from_wormbase(wb_species, bioproject, label_dir, wbps_types, dry_run, log, wbps_version)
             if not dry_run:
-                valid, _, _ = validate_download(label_dir, row["include_annotation"], row["include_protein"], log)
+                valid, _, _, _ = validate_download(
+                    label_dir, row["include_annotation"], row["include_protein"], row["include_cds"], log,
+                )
                 if valid:
                     wormbase_primary = True
 
         # --- NCBI / ENA fallback (when WormBase unavailable or incomplete) ---
         if not wormbase_primary:
-            include = build_include(row["include_annotation"], row["include_protein"])
+            include = build_include(
+                row["include_annotation"], row["include_protein"], row["include_cds"],
+            )
             zip_name = f"{label}.zip"
             zip_path = download_root / zip_name
             accession = assembly_id or bioproject
@@ -849,7 +969,11 @@ def cmd_download(
 
             if not ncbi_success and assembly_id:
                 log.info("%s: NCBI download failed, trying ENA download for %s", label, assembly_id)
-                if download_from_ena(assembly_id, label_dir, row["include_annotation"], row["include_protein"], dry_run, log):
+                if download_from_ena(
+                    assembly_id, label_dir, 
+                    row["include_annotation"], row["include_protein"], row["include_cds"],
+                    dry_run, log,
+                ):
                     log.info("%s: Successfully downloaded from ENA", label)
                     ena_downloaded = True
                 else:
@@ -884,6 +1008,8 @@ def cmd_download(
                     wbps_types_supp.append("gff3")
                 if row["include_protein"]:
                     wbps_types_supp.append("protein")
+                if row["include_cds"]:
+                    wbps_types_supp.append("cds_transcripts")
                 if wbps_types_supp:
                     wbps_dir = find_wormbase_data_dir(label_dir)
                     if not _wbps_download_complete(wbps_dir, wb_species, bioproject, wbps_version, wbps_types_supp):
@@ -892,9 +1018,13 @@ def cmd_download(
 
         # --- Validate and write manifest ---
         if not dry_run and label_dir.exists():
-            valid, missing_gff, missing_protein = validate_download(label_dir, row["include_annotation"], row["include_protein"], log)
+            valid, missing_gff, missing_protein, missing_cds = validate_download(
+                label_dir, row["include_annotation"], row["include_protein"], row["include_cds"], log,
+            )
             if valid:
-                manifest_data = discover_manifest_paths(label_dir, row["include_protein"])
+                manifest_data = discover_manifest_paths(
+                    label_dir, row["include_protein"], row["include_cds"],
+                )
                 manifest_data["bioproject"] = bioproject
                 manifest_data["label"] = label
                 metadata_fields = ["taxon", "taxon_id", "assembly_id", "assembly_level", "source", "genome_size", "reference",
@@ -907,6 +1037,8 @@ def cmd_download(
                     missing_parts.append("gff3")
                 if missing_protein:
                     missing_parts.append("protein")
+                if missing_cds:
+                    missing_parts.append("cds")
                 if missing_parts:
                     if wb_species:
                         log.info("%s: some files still missing after WormBase download", label)
@@ -955,7 +1087,9 @@ def cmd_repair(
         label = row["label"]
         bioproject = row["bioproject"]
         label_dir = get_label_dir(download_root, label)
-        st = get_status(label_dir, row["include_annotation"], row["include_protein"])
+        st = get_status(
+            label_dir, row["include_annotation"], row["include_protein"], row["include_cds"],
+        )
 
         if st["status"] == "not_started":
             log.info("%s: not_started; run download first", label)
@@ -989,6 +1123,8 @@ def cmd_repair(
                 wbps_types.append("gff3")
             if row["include_protein"] and not st["has_protein"]:
                 wbps_types.append("protein")
+            if row["include_cds"] and not st["has_cds"]:
+                wbps_types.append("cds_transcripts")
             if not st["has_genome"]:
                 wbps_types.insert(0, "genome")
             if wbps_types:
@@ -1000,9 +1136,13 @@ def cmd_repair(
 
         # Re-validate and write manifest
         if not dry_run:
-            valid, missing_gff, missing_protein = validate_download(label_dir, row["include_annotation"], row["include_protein"], log)
+            valid, missing_gff, missing_protein, missing_cds = validate_download(
+                label_dir, row["include_annotation"], row["include_protein"], row["include_cds"], log,
+            )
             if valid:
-                manifest_data = discover_manifest_paths(label_dir, row["include_protein"])
+                manifest_data = discover_manifest_paths(
+                    label_dir, row["include_protein"], row["include_cds"],
+                )
                 manifest_data["bioproject"] = bioproject
                 manifest_data["label"] = label
                 metadata_fields = ["taxon", "taxon_id", "assembly_id", "assembly_level", "source", "genome_size", "reference",
@@ -1016,6 +1156,8 @@ def cmd_repair(
                     missing.append("gff3")
                 if missing_protein:
                     missing.append("protein")
+                if missing_cds:
+                    missing.append("cds")
                 action = "repaired" if repaired else "unchanged"
                 if missing:
                     summaries.append(f"{label}\t{bioproject}\t{action} (missing {', '.join(missing)})")
@@ -1059,7 +1201,7 @@ def main() -> int:
     ap.add_argument("--skip-wormbase", action="store_true",
                      help="Skip WormBase ParaSite supplement for missing annotations/proteins")
     sub = ap.add_subparsers(dest="command", required=True)
-    sub.add_parser("status", help="Report status per row (not_started | dehydrated_only | rehydrated | complete)")
+    sub.add_parser("status", help="Print download status table: status + genome/gff3/protein/cds + sources per row")
     dl = sub.add_parser("download", help="Download and optionally rehydrate")
     dl.add_argument("--dehydrated", action="store_true", help="Download dehydrated (then rehydrate)")
     dl.add_argument("--force", action="store_true",

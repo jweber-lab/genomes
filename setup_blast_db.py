@@ -112,6 +112,16 @@ def find_wormbase_data_dir(label_dir: Path) -> Path | None:
     return d if d.is_dir() else None
 
 
+def _is_cds_nucleotide_fasta(path: Path) -> bool:
+    """True if path looks like a CDS (nucleotide) FASTA, not genome or protein."""
+    name = path.name.lower()
+    if path.suffix.lower() == ".faa":
+        return False
+    if "protein" in name:
+        return False
+    return "cds" in name
+
+
 REGISTRY_NAME = "registry.yaml"
 STAGING_SUFFIX = ".staging"
 MAKEBLASTDB = "makeblastdb"
@@ -168,6 +178,8 @@ def read_csv(csv_path: Path) -> list[dict[str, Any]]:
             r["source"] = detect_project_source(bioproject)
             inc_prot = (r.get("include_protein") or "true").strip().lower()
             r["include_protein"] = inc_prot in ("true", "1", "yes")
+            inc_cds = (r.get("include_cds") or "true").strip().lower()
+            r["include_cds"] = inc_cds in ("true", "1", "yes")
             rows.append(r)
     return rows
 
@@ -180,11 +192,15 @@ def get_manifest_paths(download_root: Path, label: str) -> dict[str, Any] | None
         return json.load(f)
 
 
-def discover_paths(download_root: Path, label: str, include_protein: bool) -> dict[str, list[Path]]:
-    """Discover genome FASTA, GFF, and optionally protein FASTA.
+def discover_paths(
+    download_root: Path, label: str, include_protein: bool, include_cds: bool = True,
+) -> dict[str, list[Path]]:
+    """Discover genome FASTA, GFF, and optionally protein and CDS FASTA.
     Supports NCBI, ENA, and WormBase ParaSite download structures."""
     label_dir = download_root / label
-    out: dict[str, list[Path]] = {"genome_fasta": [], "gff": [], "protein_fasta": []}
+    out: dict[str, list[Path]] = {
+        "genome_fasta": [], "gff": [], "protein_fasta": [], "cds_fasta": [],
+    }
     seen: set[Path] = set()
 
     def _add(key: str, path: Path) -> None:
@@ -198,17 +214,25 @@ def discover_paths(download_root: Path, label: str, include_protein: bool) -> di
             continue
         for f in d.rglob("*.fna"):
             if f.is_file() and f.stat().st_size > 0:
-                _add("genome_fasta", f)
+                if include_cds and _is_cds_nucleotide_fasta(f):
+                    _add("cds_fasta", f)
+                elif not _is_cds_nucleotide_fasta(f):
+                    _add("genome_fasta", f)
         for f in d.rglob("*.fa"):
             if f.is_file() and f.stat().st_size > 0:
                 if "protein" in f.name.lower():
                     if include_protein:
                         _add("protein_fasta", f)
+                elif include_cds and _is_cds_nucleotide_fasta(f):
+                    _add("cds_fasta", f)
                 else:
                     _add("genome_fasta", f)
         for f in d.rglob("*.fasta"):
             if f.is_file() and f.stat().st_size > 0 and "protein" not in f.name.lower():
-                _add("genome_fasta", f)
+                if include_cds and _is_cds_nucleotide_fasta(f):
+                    _add("cds_fasta", f)
+                elif not _is_cds_nucleotide_fasta(f):
+                    _add("genome_fasta", f)
         for f in d.rglob("*.faa"):
             if f.is_file() and f.stat().st_size > 0 and include_protein:
                 _add("protein_fasta", f)
@@ -220,8 +244,8 @@ def discover_paths(download_root: Path, label: str, include_protein: bool) -> di
 
 
 def paths_from_manifest(manifest: dict, download_root: Path, label: str) -> dict[str, list[Path]]:
-    """Convert manifest (paths as strings) to Path lists. Manifest keys: genome_fasta, gff, protein_fasta."""
-    out: dict[str, list[Path]] = {"genome_fasta": [], "gff": [], "protein_fasta": []}
+    """Convert manifest (paths as strings) to Path lists."""
+    out: dict[str, list[Path]] = {"genome_fasta": [], "gff": [], "protein_fasta": [], "cds_fasta": []}
     for key in out:
         for p in manifest.get(key) or []:
             path = Path(p)
@@ -382,6 +406,7 @@ def build_one_label(
     download_root: Path,
     blast_db_root: Path,
     include_protein: bool,
+    include_cds: bool,
     max_file_sz: str | None,
     dry_run: bool,
     log: logging.Logger,
@@ -396,7 +421,7 @@ def build_one_label(
         paths = paths_from_manifest(manifest, download_root, label_name)
         copy_metadata_fields(manifest, metadata, METADATA_FIELDS)
     else:
-        paths = discover_paths(download_root, label_name, include_protein)
+        paths = discover_paths(download_root, label_name, include_protein, include_cds)
     # CSV fallback for metadata if manifest missing fields
     if csv_metadata:
         copy_metadata_fields(csv_metadata, metadata, METADATA_FIELDS)
@@ -496,6 +521,7 @@ def build_all(
                 download_root,
                 blast_db_root,
                 row["include_protein"],
+                row["include_cds"],
                 max_file_sz,
                 dry_run,
                 log,
@@ -512,6 +538,7 @@ def build_all(
                     download_root,
                     blast_db_root,
                     row["include_protein"],
+                    row["include_cds"],
                     max_file_sz,
                     dry_run,
                     log,

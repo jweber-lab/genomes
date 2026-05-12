@@ -106,6 +106,8 @@ python download_genomes.py --csv bioprojects.csv repair
 
 Optional: use `config.yml` for `download_root`, `rehydrate_workers`, `wbps_version`, etc. Use `--dry-run` to print actions without downloading. Use `--skip-wormbase` to disable the automatic WormBase ParaSite supplement.
 
+**Incremental vs full refresh:** Without `--force`, `download` only fetches artifact types that are still missing for each label (genome, GFF3, protein, CDS per row flags), re-scanning after WormBase, NCBI extract/rehydrate, and supplement steps. Use `--force` to request the full enabled set from sources again (same behavior as a clean full run).
+
 **2. Build BLAST databases**
 
 ```bash
